@@ -1,0 +1,468 @@
+﻿// capri-mod: 1
+// id: app-looks
+// name: Образ по программе
+// version: 1.2.0
+// author: Xero
+// description: Кими меняет цвета под программу, в которой ты сейчас, — с гличом, — и интерфейс перекрашивается вместе с ней. Цвета в app-looks.txt. Голосом: «выключи перекраску» / «включи перекраску».
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using CapriDesktop;
+
+public class AppLooks : ICapriMod
+{
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+    const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+    ICapriHost capri;
+    Form form;            // Companion: её окно
+    object mods;          // CapriDesktop.Mods
+    MethodInfo setColours;   // ArtColors.Set(string[])
+    FieldInfo table;         // ArtColors.table, чтобы заметить, что Кими сама перекрасилась
+    FieldInfo skinChanged;   // Mods.SkinChanged
+    MethodInfo reskinned;    // Companion.Reskinned (запасной путь)
+    PropertyInfo coloursNow; // Mods.ColoursNow, её собственные цвета
+
+    System.Threading.Timer timer;
+    readonly object gate = new object();
+    List<KeyValuePair<string, string[]>> looks = new List<KeyValuePair<string, string[]>>();
+    int myPid;
+    bool enabled = true;
+    string seenKey = null; int seenTicks = 0;
+    string appliedKey = "";
+    object appliedTable = null;
+
+    const string DefaultLooks =
+"# Образ по программе: имя процесса (или его часть) = волосы акценты глаза края тело\n" +
+"# Цвета в формате #RRGGBB, '-' значит оставить её обычный цвет. Первая подходящая строка выигрывает.\n" +
+"# Имя процесса видно в Диспетчере задач → Подробности (без .exe). Файл перечитывается сам.\n" +
+"fortnite       = #A64DFF #FFD23F #3FD0FF #5B2BD9 #0A0618\n" +
+"cyberpunk2077  = #FCEE0A #00F0FF #FF003C #E0C200 #0A0A02\n" +
+"tlou           = #7FA650 #C8A35A #E8D9A8 #4F6B2E #070A04\n" +
+"steam          = #66C0F4 #A4D007 #C7E8FF #2A6FA8 #050A12\n" +
+"epicgameslauncher = #E8E8E8 #2F7BFF #FFFFFF #8A8A8A #0A0A0A\n" +
+"blender        = #FF8A00 #4E9CFF #FFC266 #E06C00 #120A04\n" +
+"unity          = #E0E0E0 #00B0FF #FFFFFF #7A7A7A #08080A\n" +
+"code           = #2D8CFF #00E0A0 #7CC4FF #1F5FD0 #040A14\n" +
+"devenv         = #A070FF #68217A #D5C2FF #68217A #0A0612\n" +
+"rider          = #FF318C #FFD500 #FF80B5 #C90F5E #12040A\n" +
+"pycharm        = #21D789 #FCF84A #8CF0C0 #149E62 #04120A\n" +
+"windowsterminal = #3BFF6B #FFB000 #9CFFB4 #1FA841 #020A04\n" +
+"powershell     = #3BFF6B #FFB000 #9CFFB4 #1FA841 #020A04\n" +
+"claude         = #D97757 #F5E6D3 #F2A98A #B85C3E #120806\n" +
+"discord        = #5865F2 #57F287 #EB459E #3B44C4 #06071A\n" +
+"telegram       = #2AABEE #FFFFFF #8FD8FF #1C7FB8 #04101A\n" +
+"spotify        = #1DB954 #FFFFFF #7CF0A6 #148A3E #040C06\n" +
+"chrome         = #FF4D4D #FFD23F #4D9BFF #2EBD59 #0A0A0A\n" +
+"msedge         = #1FB3E6 #4CD964 #8FE3FF #0C6FB0 #040C12\n" +
+"brave          = #FF5A1F #FFFFFF #FFAA80 #C93A0A #120604\n" +
+"firefox        = #FF7139 #9059FF #FFB37A #E0471A #120604\n" +
+"opera          = #FF1B2D #FFFFFF #FF7A85 #B5101E #120204\n" +
+"obs64          = #9B6BFF #FF4D4D #D2BEFF #6B3FD6 #08060F\n";
+
+    public void Start(ICapriHost host)
+    {
+        capri = host;
+        myPid = Process.GetCurrentProcess().Id;
+        try
+        {
+            FieldInfo cf = host.GetType().GetField("capri", Any);
+            form = cf == null ? null : cf.GetValue(host) as Form;
+            if (form == null) { capri.Log("app-looks: не нашла её окно, мод спит"); return; }
+            Type companion = form.GetType();
+            Assembly asm = companion.Assembly;
+            PropertyInfo ml = companion.GetProperty("ModList", Any);
+            mods = ml == null ? null : ml.GetValue(form, null);
+            Type art = asm.GetType("CapriDesktop.ArtColors");
+            setColours = art == null ? null : art.GetMethod("Set", Any, null, new Type[] { typeof(string[]) }, null);
+            table = art == null ? null : art.GetField("table", Any);
+            reskinned = companion.GetMethod("Reskinned", Any, null, Type.EmptyTypes, null);
+            if (mods != null)
+            {
+                skinChanged = mods.GetType().GetField("SkinChanged", Any);
+                coloursNow = mods.GetType().GetProperty("ColoursNow", Any);
+            }
+            if (setColours == null || coloursNow == null) { capri.Log("app-looks: эта версия Кими перекрашивается иначе, мод спит"); return; }
+            try { FindUi(asm, art); } catch (Exception e) { uiFields = null; capri.Log("app-looks: интерфейс не перекрашу: " + e.Message); }
+        }
+        catch (Exception e) { capri.Log("app-looks: " + e.Message); return; }
+
+        LoadLooks();
+        timer = new System.Threading.Timer(Tick, null, 1500, 700);
+        capri.Log("app-looks: работаю, " + looks.Count + " образов");
+    }
+
+    string LooksFile { get { return Path.Combine(capri.Folder, "app-looks.txt"); } }
+    DateTime looksStamp = DateTime.MinValue;
+
+    void LoadLooks()
+    {
+        try
+        {
+            string path = LooksFile;
+            if (!File.Exists(path))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path, DefaultLooks, new UTF8Encoding(true));
+            }
+            DateTime stamp = File.GetLastWriteTimeUtc(path);
+            if (stamp == looksStamp) return;
+            looksStamp = stamp;
+            var list = new List<KeyValuePair<string, string[]>>();
+            foreach (string raw in File.ReadAllLines(path))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = line.Substring(0, eq).Trim().ToLowerInvariant();
+                string[] parts = line.Substring(eq + 1).Split(new char[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries);
+                string[] slots = new string[5];
+                for (int i = 0; i < 5 && i < parts.Length; i++) slots[i] = Hex(parts[i]);
+                list.Add(new KeyValuePair<string, string[]>(key, slots));
+            }
+            lock (gate) { looks = list; appliedKey = "\u0001"; }
+        }
+        catch (Exception e) { capri.Log("app-looks: не прочитала app-looks.txt: " + e.Message); }
+    }
+
+    static string Hex(string s)
+    {
+        s = s.Trim();
+        if (!s.StartsWith("#")) s = "#" + s;
+        if (s.Length != 7) return null;
+        for (int i = 1; i < 7; i++) if (Uri.IsHexDigit(s[i]) == false) return null;
+        return s.ToUpperInvariant();
+    }
+
+    string ForegroundApp()
+    {
+        IntPtr w = GetForegroundWindow();
+        if (w == IntPtr.Zero) return null;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        if (pid == 0 || pid == myPid) return null; // её собственные окна и Mainframe не считаются
+        try { using (Process p = Process.GetProcessById((int)pid)) return p.ProcessName.ToLowerInvariant(); }
+        catch { return null; }
+    }
+
+    void Tick(object state)
+    {
+        try
+        {
+            if (!enabled) return;
+            LoadLooks();
+            string app = ForegroundApp();
+            if (app == null) return;
+            string key = ""; string[] look = null;
+            lock (gate)
+            {
+                foreach (var kv in looks)
+                    if (app.Contains(kv.Key)) { key = kv.Key; look = kv.Value; break; }
+            }
+            if (key != seenKey) { seenKey = key; seenTicks = 0; }
+            seenTicks++;
+            bool drifted = appliedTable != null && table != null && !ReferenceEquals(table.GetValue(null), appliedTable);
+            // в Mainframe сменили тему: её палитра снова стоковая, перекрашиваем заново
+            if (neonMine != null && neonNow != null && !ReferenceEquals(neonNow.GetValue(null), neonMine)) drifted = true;
+            if (seenTicks < 2 && !drifted) return;          // не дёргаемся при быстром alt-tab
+            if (key == appliedKey && !drifted) return;
+            appliedKey = key;
+            Apply(look);
+        }
+        catch (Exception e) { capri.Log("app-looks tick: " + e.Message); }
+    }
+
+    void Apply(string[] look) { Apply(look, false); }
+
+    // restoreUi: вернуть интерфейсу родные цвета (мод выключают или выгружают)
+    void Apply(string[] look, bool restoreUi)
+    {
+        if (form == null || form.IsDisposed || !form.IsHandleCreated) return;
+        form.BeginInvoke((MethodInvoker)delegate
+        {
+            // смена образа — через её глич: клип стартует, цвета меняются посреди него
+            if (!restoreUi && Glitch())
+            {
+                var later = new System.Windows.Forms.Timer { Interval = 140 };
+                later.Tick += delegate { later.Stop(); later.Dispose(); Recolour(look, restoreUi); };
+                later.Start();
+            }
+            else Recolour(look, restoreUi);
+        });
+    }
+
+    MethodInfo playClip; FieldInfo fClip, fGlitch, fPerchGlitch, fLayGlitch, fLying, fSeat, fOnPanel, fHidden, fHanging, fFrames;
+    PropertyInfo pAsleep;
+    bool glitchReady, glitchTried;
+
+    bool Glitch()
+    {
+        try
+        {
+            if (!glitchTried)
+            {
+                glitchTried = true;
+                Type c = form.GetType();
+                playClip = c.GetMethod("Play", Any);
+                fClip = c.GetField("clip", Any); fGlitch = c.GetField("glitch", Any);
+                fPerchGlitch = c.GetField("perchGlitch", Any); fLayGlitch = c.GetField("laydownGlitch", Any);
+                fLying = c.GetField("lying", Any); fSeat = c.GetField("seat", Any); fOnPanel = c.GetField("onPanel", Any);
+                fHidden = c.GetField("hidden", Any); fHanging = c.GetField("hanging", Any); fFrames = c.GetField("frames", Any);
+                pAsleep = c.GetProperty("Asleep", Any);
+                glitchReady = playClip != null && fGlitch != null && fFrames != null;
+                if (!glitchReady) capri.Log("app-looks: глич не нашла, перекрашиваю без него");
+            }
+            if (!glitchReady) return false;
+            if (Flag(fHidden) || Flag(fHanging)) return false;
+            if (pAsleep != null && (bool)pAsleep.GetValue(form, null)) return false;
+            object clip = Flag(fLying) ? fLayGlitch.GetValue(form)
+                : (fSeat != null && fSeat.GetValue(form) != null) || Flag(fOnPanel) ? fPerchGlitch.GetValue(form)
+                : fGlitch.GetValue(form);
+            if (clip == null) clip = fGlitch.GetValue(form);
+            if (clip == null) return false;
+            playClip.Invoke(form, new object[] { clip });
+            var t = fFrames.GetValue(form) as System.Windows.Forms.Timer;
+            if (t != null) t.Start();
+            return true;
+        }
+        catch (Exception e) { capri.Log("app-looks glitch: " + e.Message); glitchReady = false; return false; }
+    }
+
+    bool Flag(FieldInfo f) { try { return f != null && (bool)f.GetValue(form); } catch { return false; } }
+
+    void Recolour(string[] look, bool restoreUi)
+    {
+        {
+            try
+            {
+                string[] own = (string[])coloursNow.GetValue(mods, null);
+                string[] want = new string[5];
+                for (int i = 0; i < 5; i++)
+                    want[i] = (look != null && look[i] != null) ? look[i] : (own != null && i < own.Length ? own[i] : null);
+                setColours.Invoke(null, new object[] { want });
+                appliedTable = table == null ? null : table.GetValue(null);
+                Redraw();
+            }
+            catch (Exception e) { capri.Log("app-looks apply: " + e.Message); }
+            try { PaintUi(restoreUi ? null : LastWant(look)); }
+            catch (Exception e) { capri.Log("app-looks ui: " + e.Message); }
+        }
+    }
+
+    string[] LastWant(string[] look)
+    {
+        string[] own = null;
+        try { own = (string[])coloursNow.GetValue(mods, null); } catch { }
+        string[] want = new string[5];
+        for (int i = 0; i < 5; i++)
+        {
+            string v = (look != null && look[i] != null) ? look[i] : (own != null && i < own.Length ? own[i] : null);
+            want[i] = v == null ? null : Hex(v);
+        }
+        return want;
+    }
+
+    // ---------- Интерфейс: пузыри, «написать ей», панели задач, окна, Mainframe ----------
+
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr h, IntPtr r, IntPtr rgn, uint flags);
+
+    // классы, где лежат цвета её интерфейса (static Color / Color[])
+    static readonly string[] UiTypes = { "Look", "CityLook", "TalkPill", "Tear", "Shatter", "HudPaint", "CallInk", "ChaosScreen" };
+    const string StockColours = "#FF0046,#00E86E,#1870F0,#7854F0,#05030A";
+
+    List<KeyValuePair<FieldInfo, Color>> uiFields;   // поле и его родной цвет
+    List<KeyValuePair<Color[], Color[]>> uiArrays;   // массив и его родное содержимое
+    string[] stock;                                 // её стоковые цвета, от них считаем сдвиг
+    FieldInfo neonNow; MethodInfo neonRecolour;
+    Color[] neonBase;   // тема Mainframe, как она была до нас
+    Color[] neonMine;   // наш перекрашенный вариант, который сейчас стоит
+
+    void FindUi(Assembly asm, Type art)
+    {
+        var fields = new List<KeyValuePair<FieldInfo, Color>>();
+        var arrays = new List<KeyValuePair<Color[], Color[]>>();
+        foreach (string n in UiTypes)
+        {
+            Type t = asm.GetType("CapriDesktop." + n);
+            if (t == null) continue;
+            foreach (FieldInfo f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+            {
+                if (f.IsLiteral || f.Name.IndexOf("Skin", StringComparison.OrdinalIgnoreCase) >= 0) continue; // кожу не трогаем
+                if (f.FieldType == typeof(Color)) fields.Add(new KeyValuePair<FieldInfo, Color>(f, (Color)f.GetValue(null)));
+                else if (f.FieldType == typeof(Color[]))
+                {
+                    Color[] a = f.GetValue(null) as Color[];
+                    if (a != null) arrays.Add(new KeyValuePair<Color[], Color[]>(a, (Color[])a.Clone()));
+                }
+            }
+        }
+        string[] usual = null;
+        FieldInfo uf = art == null ? null : art.GetField("Usual", Any);
+        if (uf != null) usual = uf.GetValue(null) as string[];
+        if (usual == null || usual.Length < 5) usual = StockColours.Split(',');
+        stock = new string[5];
+        for (int i = 0; i < 5; i++) stock[i] = Hex(usual[i]) ?? Hex(StockColours.Split(',')[i]);
+
+        Type neon = asm.GetType("CapriDesktop.Neon");
+        if (neon != null)
+        {
+            neonNow = neon.GetField("now", Any);
+            neonRecolour = neon.GetMethod("Recolour", Any, null, new Type[] { typeof(Control), typeof(Color[]), typeof(HashSet<Control>) }, null);
+            if (neonNow != null && neonNow.FieldType != typeof(Color[])) neonNow = null;
+        }
+        uiFields = fields; uiArrays = arrays;
+        capri.Log("app-looks: интерфейс — " + fields.Count + " цветов, " + arrays.Count + " палитр" + (neonNow != null ? ", тема Mainframe" : ""));
+    }
+
+    // want == null: вернуть всё как было
+    void PaintUi(string[] want)
+    {
+        if (uiFields == null) return;
+        Shift m = want == null ? null : new Shift(stock, want);
+
+        foreach (var kv in uiFields)
+            try { kv.Key.SetValue(null, m == null ? kv.Value : m.Of(kv.Value)); } catch { }
+        foreach (var kv in uiArrays)
+            for (int i = 0; i < kv.Key.Length && i < kv.Value.Length; i++)
+                kv.Key[i] = m == null ? kv.Value[i] : m.Of(kv.Value[i]);
+
+        Color[] was = null;
+        if (neonNow != null)
+        {
+            Color[] cur = neonNow.GetValue(null) as Color[];
+            if (cur != null)
+            {
+                if (!ReferenceEquals(cur, neonMine)) neonBase = cur;   // свежая тема из Mainframe
+                Color[] next;
+                if (m == null) next = neonBase;
+                else { next = new Color[neonBase.Length]; for (int i = 0; i < next.Length; i++) next[i] = m.Of(neonBase[i]); }
+                if (!ReferenceEquals(next, cur))
+                {
+                    neonNow.SetValue(null, next);
+                    was = cur;
+                }
+                neonMine = m == null ? null : next;
+            }
+        }
+
+        var forms = new List<Form>();
+        foreach (Form f in Application.OpenForms) forms.Add(f);
+        foreach (Form f in forms)
+        {
+            try
+            {
+                if (f.IsDisposed || !f.IsHandleCreated) continue;
+                if (was != null && neonRecolour != null && !ReferenceEquals(f, form))
+                {
+                    // как сама Кими меняет тему: без мигания, потом одна перерисовка
+                    SendMessage(f.Handle, 11, IntPtr.Zero, IntPtr.Zero);
+                    try { neonRecolour.Invoke(null, new object[] { f, was, new HashSet<Control>() }); }
+                    finally { SendMessage(f.Handle, 11, (IntPtr)1, IntPtr.Zero); }
+                    RedrawWindow(f.Handle, IntPtr.Zero, IntPtr.Zero, 0x85);
+                }
+                f.Invalidate(true);
+            }
+            catch (Exception e) { capri.Log("app-looks ui " + f.GetType().Name + ": " + e.Message); }
+        }
+    }
+
+    // Сдвиг цвета: насыщенные цвета едут по оттенку за ближайшим её цветом (волосы, акценты, глаза, края),
+    // тёмные фоны чуть подкрашиваются под её тело, серые и белые (текст) остаются как есть.
+    class Shift
+    {
+        readonly double[] sh = new double[4], ss = new double[4], sl = new double[4];
+        readonly double[] ch = new double[4], cs = new double[4], cl = new double[4];
+        readonly int dr, dg, db;
+
+        public Shift(string[] stock, string[] want)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                Color s = Parse(stock[i]), c = want[i] == null ? s : Parse(want[i]);
+                sh[i] = s.GetHue(); ss[i] = s.GetSaturation(); sl[i] = s.GetBrightness();
+                ch[i] = c.GetHue(); cs[i] = c.GetSaturation(); cl[i] = c.GetBrightness();
+            }
+            Color sb = Parse(stock[4]), cb = want[4] == null ? sb : Parse(want[4]);
+            dr = cb.R - sb.R; dg = cb.G - sb.G; db = cb.B - sb.B;
+        }
+
+        static Color Parse(string hex) { return ColorTranslator.FromHtml(hex); }
+
+        public Color Of(Color c)
+        {
+            if (c.A == 0) return c;
+            double h = c.GetHue(), s = c.GetSaturation(), l = c.GetBrightness();
+            if (s < 0.2 || l < 0.08 || l > 0.97 || (l > 0.85 && s < 0.45))
+            {
+                if (l < 0.3) return Color.FromArgb(c.A, Clamp(c.R + dr), Clamp(c.G + dg), Clamp(c.B + db));
+                return c;
+            }
+            int k = 0; double best = 999;
+            for (int i = 0; i < 4; i++)
+            {
+                double d = Math.Abs(h - sh[i]); if (d > 180) d = 360 - d;
+                if (d < best) { best = d; k = i; }
+            }
+            double off = h - sh[k]; if (off > 180) off -= 360; if (off < -180) off += 360;
+            double moved = Math.Abs(ch[k] - sh[k]); if (moved > 180) moved = 360 - moved;
+            double pull = Math.Min(1.0, moved / 30 + Math.Abs(cs[k] - ss[k]) * 2 + Math.Abs(cl[k] - sl[k]) * 2); // 0, если её цвет не менялся
+            double nh = h + (ch[k] - sh[k]) - off * 0.65 * pull; nh = ((nh % 360) + 360) % 360;   // ближе к её цвету, но оттенки не сливаются
+            double ns = ss[k] > 0.01 ? Math.Min(1.0, s * cs[k] / ss[k]) : s;
+            double nl = Math.Max(0.06, Math.Min(0.94, l + (cl[k] - sl[k]) * 0.6));
+            return FromHsl(c.A, nh, ns, nl);
+        }
+
+        static int Clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+        static Color FromHsl(int a, double h, double s, double l)
+        {
+            double q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q, hk = h / 360.0;
+            return Color.FromArgb(a, Channel(p, q, hk + 1.0 / 3), Channel(p, q, hk), Channel(p, q, hk - 1.0 / 3));
+        }
+
+        static int Channel(double p, double q, double t)
+        {
+            if (t < 0) t += 1; if (t > 1) t -= 1;
+            double v = t < 1.0 / 6 ? p + (q - p) * 6 * t : t < 0.5 ? q : t < 2.0 / 3 ? p + (q - p) * (2.0 / 3 - t) * 6 : p;
+            return Clamp((int)Math.Round(v * 255));
+        }
+    }
+
+    void Redraw()
+    {
+        Action changed = skinChanged == null ? null : skinChanged.GetValue(mods) as Action;
+        if (changed != null) changed();
+        else if (reskinned != null) reskinned.Invoke(form, null);
+    }
+
+    public bool Heard(string words)
+    {
+        string w = (words ?? "").ToLowerInvariant();
+        if (w.Contains("перекраск") || w.Contains("цвета по программ"))
+        {
+            bool off = w.Contains("выключ") || w.Contains("отключ") || w.Contains("убери") || w.Contains("стоп");
+            enabled = !off;
+            if (off) { appliedKey = "\u0001"; Apply(null, true); capri.Say("Ладно, хожу в своих цветах."); }
+            else { appliedKey = "\u0001"; seenKey = null; capri.Say("Включила, буду переодеваться под каждую программу."); }
+            return true;
+        }
+        return false;
+    }
+
+    public void Stop()
+    {
+        enabled = false;
+        if (timer != null) { timer.Dispose(); timer = null; }
+        try { Apply(null, true); } catch { }
+    }
+}
